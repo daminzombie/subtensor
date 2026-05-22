@@ -26,7 +26,6 @@ use sp_consensus_babe::BabeConfiguration;
 use sp_consensus_slots::SlotDuration;
 use sp_inherents::CreateInherentDataProviders;
 use sp_keystore::KeystorePtr;
-use sp_runtime::Digest;
 use sp_runtime::traits::Block as BlockT;
 use sp_runtime::traits::NumberFor;
 use stc_shield::InherentDataProvider as ShieldInherentDataProvider;
@@ -134,12 +133,6 @@ impl ConsensusMechanism for AuraConsensus {
             );
         let shield = stc_shield::InherentDataProvider::new(shield_keystore);
         Ok((slot, timestamp, shield))
-    }
-
-    fn simulation_pre_digest(slot: sp_consensus_slots::Slot) -> Digest {
-        Digest {
-            logs: vec![sc_consensus_aura::standalone::pre_digest::<AuraPair>(slot)],
-        }
     }
 
     fn new() -> Self {

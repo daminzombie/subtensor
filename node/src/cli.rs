@@ -37,7 +37,7 @@ pub struct Cli {
     pub eth: EthConfiguration,
 
     #[command(flatten)]
-    pub authoring_sim: AuthoringSimulationCli,
+    pub event_export: EventExportCli,
 
     /// Control historical gap-backfill during initial/catch-up sync.
     ///
@@ -48,29 +48,29 @@ pub struct Cli {
     pub history_backfill: HistoryBackfill,
 }
 
-/// Configuration flags for local authoring simulation.
+/// Configuration flags for passive event export.
 #[derive(Debug, Clone, Default, clap::Args)]
-pub struct AuthoringSimulationCli {
-    /// Build a local candidate block every slot and record txpool/block-building diagnostics.
+pub struct EventExportCli {
+    /// Record chain, block announce, and transaction pool timeline events.
     #[arg(
-        long = "authoring-sim",
-        id = "authoring-sim-enabled",
+        long = "event-export",
+        id = "event-export-enabled",
         action = clap::ArgAction::SetTrue
     )]
     pub enabled: bool,
 
-    /// SQLite database path for authoring simulation diagnostics.
+    /// SQLite database path for exported node events.
     ///
-    /// Defaults to `<base-path>/<chain-id>/authoring-sim.sqlite`.
-    #[arg(long = "authoring-sim-db", value_name = "PATH")]
+    /// Defaults to `<base-path>/<chain-id>/event-export.sqlite`.
+    #[arg(long = "event-export-db", value_name = "PATH")]
     pub db: Option<PathBuf>,
 
-    /// Include full encoded extrinsic bytes in the authoring simulation database.
-    #[arg(long = "authoring-sim-log-xt-data", default_value_t = true)]
+    /// Include full encoded extrinsic bytes in the event export database.
+    #[arg(long = "event-export-log-xt-data", default_value_t = true)]
     pub log_xt_data: bool,
 
     /// Number of events buffered before instrumentation starts dropping diagnostics.
-    #[arg(long = "authoring-sim-channel-capacity", default_value_t = 100_000)]
+    #[arg(long = "event-export-channel-capacity", default_value_t = 100_000)]
     pub channel_capacity: usize,
 }
 

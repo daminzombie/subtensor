@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Local web UI for inspecting authoring simulation SQLite databases.
+Local web UI for inspecting event export SQLite databases.
 
 Usage:
-    python3 scripts/authoring_sim_ui.py --db /path/to/authoring-sim.sqlite
-    AUTHORING_SIM_DB=/var/lib/subtensor/chains/bittensor/authoring-sim.sqlite uvicorn scripts.authoring_sim_ui:asgi_app --host 0.0.0.0 --port 8787
+    python3 scripts/event_export_ui.py --db /path/to/event-export.sqlite
+    EVENT_EXPORT_DB=/var/lib/subtensor/chains/bittensor/event-export.sqlite uvicorn scripts.event_export_ui:asgi_app --host 0.0.0.0 --port 8787
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Any
 
 
 DEFAULT_LIMIT = 200
-MAX_LIMIT = 1000
+MAX_LIMIT = 5000
 
 
 def clamp_limit(value: str | None, default: int = DEFAULT_LIMIT) -> int:
@@ -37,6 +37,14 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.hex()
     return value
+
+
+def details_value(row: dict[str, Any], key: str) -> Any:
+    try:
+        details = json.loads(row.get("details_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return details.get(key) if isinstance(details, dict) else None
 
 
 class Db:
@@ -79,47 +87,30 @@ class App:
 
     def summary(self) -> dict[str, Any]:
         counts = {
-            name: self.db.scalar(f"SELECT COUNT(*) FROM {name}") or 0
-            for name in (
-                "sim_blocks",
-                "extrinsics",
-                "extrinsic_events",
-                "pool_views",
-                "pool_view_members",
-                "chain_events",
-                "sim_timeline_events",
-                "writer_stats",
-            )
+            "events": self.db.scalar("SELECT COUNT(*) FROM events") or 0,
+            "tx_events": self.db.scalar("SELECT COUNT(*) FROM events WHERE tx_hash IS NOT NULL")
+            or 0,
+            "chain_events": self.db.scalar("SELECT COUNT(*) FROM events WHERE source = 'chain'")
+            or 0,
+            "pool_events": self.db.scalar("SELECT COUNT(*) FROM events WHERE source = 'pool'")
+            or 0,
+            "timeline_events": self.db.scalar("SELECT COUNT(*) FROM events WHERE source = 'timeline'")
+            or 0,
         }
 
-        latest_time = self.db.scalar(
-            """
-            SELECT MAX(event_time_ms) FROM (
-                SELECT event_time_ms FROM sim_blocks
-                UNION ALL SELECT event_time_ms FROM extrinsic_events
-                UNION ALL SELECT event_time_ms FROM pool_views
-                UNION ALL SELECT event_time_ms FROM chain_events
-                UNION ALL SELECT event_time_ms FROM sim_timeline_events
-                UNION ALL SELECT event_time_ms FROM writer_stats
-            )
-            """
-        )
+        latest_time = self.db.scalar("SELECT MAX(event_time_ms) FROM events")
 
         return {
             "db_path": str(self.db.path),
             "counts": counts,
             "latest_event_time_ms": latest_time,
             "latest_writer": self.db.one(
-                "SELECT * FROM writer_stats ORDER BY event_time_ms DESC, seq DESC LIMIT 1"
+                "SELECT * FROM events WHERE source = 'writer' ORDER BY event_time_ms DESC, seq DESC LIMIT 1"
             ),
             "recent_event_kinds": self.db.rows(
                 """
                 SELECT event_kind, COUNT(*) AS count, MAX(event_time_ms) AS last_time_ms
-                FROM (
-                    SELECT event_time_ms, event_kind FROM extrinsic_events
-                    UNION ALL SELECT event_time_ms, event_kind FROM chain_events
-                    UNION ALL SELECT event_time_ms, event_kind FROM sim_timeline_events
-                )
+                FROM events
                 GROUP BY event_kind
                 ORDER BY last_time_ms DESC
                 LIMIT 20
@@ -135,8 +126,14 @@ class App:
                     MIN(ev.event_time_ms) AS first_time_ms,
                     MAX(ev.event_time_ms) AS last_time_ms,
                     MAX(ev.event_time_ms) - MIN(ev.event_time_ms) AS lifetime_ms
-                FROM extrinsic_events ev
-                LEFT JOIN extrinsics x ON x.tx_hash = ev.tx_hash
+                FROM events ev
+                LEFT JOIN (
+                    SELECT tx_hash, MAX(classification) AS classification, MAX(status) AS last_status
+                    FROM events
+                    WHERE tx_hash IS NOT NULL
+                    GROUP BY tx_hash
+                ) x ON x.tx_hash = ev.tx_hash
+                WHERE ev.tx_hash IS NOT NULL
                 GROUP BY ev.tx_hash
                 ORDER BY lifetime_ms DESC, last_time_ms DESC
                 LIMIT 20
@@ -156,19 +153,8 @@ class App:
 
         rows = self.db.rows(
             f"""
-            SELECT * FROM (
-                SELECT event_time_ms, 'chain' AS source, event_kind, NULL AS tx_hash,
-                    block_number, block_hash AS parent_hash, NULL AS view_id, details_json
-                FROM chain_events
-                UNION ALL
-                SELECT event_time_ms, 'tx' AS source, event_kind, tx_hash,
-                    block_number, parent_hash, view_id, details_json
-                FROM extrinsic_events
-                UNION ALL
-                SELECT event_time_ms, 'sim' AS source, event_kind, NULL AS tx_hash,
-                    NULL AS block_number, parent_hash, NULL AS view_id, details_json
-                FROM sim_timeline_events
-            )
+            SELECT *, details_json AS tx_details_json
+            FROM events
             {clause}
             ORDER BY event_time_ms DESC
             LIMIT ?
@@ -178,19 +164,82 @@ class App:
         )
         return {"rows": rows, "limit": limit}
 
+    def tx_timeline(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = clamp_limit(first(query, "limit"))
+        tx_hash = first(query, "hash")
+        where = ["tx_hash IS NOT NULL"]
+        params: list[Any] = []
+        if tx_hash:
+            where.append("tx_hash = ?")
+            params.append(tx_hash)
+        clause = f"WHERE {' AND '.join(where)}"
+        rows = self.db.rows(
+            f"""
+            SELECT *, details_json AS tx_details_json
+            FROM events
+            {clause}
+            ORDER BY event_time_ms DESC, seq DESC
+            LIMIT ?
+            """,
+            tuple(params),
+            limit,
+        )
+        return {"rows": rows, "limit": limit}
+
+    def view_timeline(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = clamp_limit(first(query, "limit"))
+        rows = self.db.rows(
+            """
+            SELECT *
+            FROM events
+            WHERE event_kind = 'pool_view_created'
+            ORDER BY event_time_ms DESC, seq DESC
+            LIMIT ?
+            """,
+            (),
+            limit,
+        )
+        for row in rows:
+            members = self.db.rows(
+                """
+                SELECT tx_hash, insertion_id, status AS section, details_json
+                FROM events
+                WHERE event_kind = 'pool_view_member' AND view_id = ?
+                ORDER BY
+                    CASE status WHEN 'ready' THEN 0 WHEN 'future' THEN 1 ELSE 2 END,
+                    CAST(json_extract(details_json, '$.ordinal') AS INTEGER),
+                    seq
+                LIMIT ?
+                """,
+                (row.get("view_id"),),
+                MAX_LIMIT,
+            )
+            row["members_json"] = json.dumps(
+                [
+                    {
+                        "tx_hash": member.get("tx_hash"),
+                        "insertion_id": member.get("insertion_id"),
+                        "section": member.get("section"),
+                        "ordinal": details_value(member, "ordinal"),
+                    }
+                    for member in members
+                ]
+            )
+        return {"rows": rows, "limit": limit}
+
     def extrinsics(self, query: dict[str, list[str]]) -> dict[str, Any]:
         limit = clamp_limit(first(query, "limit"))
         search = first(query, "q")
         status = first(query, "status")
         classification = first(query, "classification")
-        where = []
+        where = ["x.tx_hash IS NOT NULL"]
         params: list[Any] = []
         if search:
             where.append("(x.tx_hash LIKE ? OR x.details_json LIKE ?)")
             like = f"%{search}%"
             params.extend([like, like])
         if status:
-            where.append("x.last_status = ?")
+            where.append("x.status = ?")
             params.append(status)
         if classification:
             where.append("x.classification = ?")
@@ -201,22 +250,26 @@ class App:
             f"""
             SELECT
                 x.tx_hash,
-                x.first_seen_time_ms,
-                x.first_seen_source,
-                x.encoded_len,
-                x.classification,
-                x.details_json,
-                x.last_status,
-                x.updated_time_ms,
-                COUNT(ev.seq) AS event_count,
-                MIN(ev.event_time_ms) AS first_event_time_ms,
-                MAX(ev.event_time_ms) AS last_event_time_ms,
-                COALESCE(MAX(ev.event_time_ms) - MIN(ev.event_time_ms), 0) AS lifetime_ms
-            FROM extrinsics x
-            LEFT JOIN extrinsic_events ev ON ev.tx_hash = x.tx_hash
+                MIN(x.event_time_ms) AS first_seen_time_ms,
+                MIN(x.source) AS first_seen_source,
+                NULL AS encoded_len,
+                MAX(x.classification) AS classification,
+                (
+                    SELECT details_json FROM events latest
+                    WHERE latest.tx_hash = x.tx_hash
+                    ORDER BY latest.event_time_ms DESC, latest.seq DESC
+                    LIMIT 1
+                ) AS details_json,
+                MAX(x.status) AS last_status,
+                MAX(x.event_time_ms) AS updated_time_ms,
+                COUNT(x.seq) AS event_count,
+                MIN(x.event_time_ms) AS first_event_time_ms,
+                MAX(x.event_time_ms) AS last_event_time_ms,
+                COALESCE(MAX(x.event_time_ms) - MIN(x.event_time_ms), 0) AS lifetime_ms
+            FROM events x
             {clause}
             GROUP BY x.tx_hash
-            ORDER BY x.updated_time_ms DESC
+            ORDER BY updated_time_ms DESC
             LIMIT ?
             """,
             tuple(params),
@@ -228,10 +281,20 @@ class App:
         tx_hash = first(query, "hash")
         if not tx_hash:
             raise ValueError("missing hash")
-        row = self.db.one("SELECT * FROM extrinsics WHERE tx_hash = ?", (tx_hash,))
+        row = self.db.one(
+            """
+            SELECT *, details_json AS tx_details_json
+            FROM events
+            WHERE tx_hash = ?
+            ORDER BY event_time_ms DESC, seq DESC
+            LIMIT 1
+            """,
+            (tx_hash,),
+        )
         events = self.db.rows(
             """
-            SELECT * FROM extrinsic_events
+            SELECT *
+            FROM events
             WHERE tx_hash = ?
             ORDER BY event_time_ms ASC, seq ASC
             LIMIT ?
@@ -241,11 +304,10 @@ class App:
         )
         views = self.db.rows(
             """
-            SELECT m.*, v.event_time_ms, v.slot, v.parent_number, v.reason
-            FROM pool_view_members m
-            JOIN pool_views v ON v.view_id = m.view_id
-            WHERE m.tx_hash = ?
-            ORDER BY v.event_time_ms ASC, m.section ASC, m.ordinal ASC
+            SELECT *
+            FROM events
+            WHERE tx_hash = ? AND view_id IS NOT NULL
+            ORDER BY event_time_ms ASC, seq ASC
             LIMIT ?
             """,
             (tx_hash,),
@@ -258,7 +320,8 @@ class App:
         rows = self.db.rows(
             """
             SELECT *
-            FROM pool_views
+            FROM events
+            WHERE event_kind = 'pool_view_created'
             ORDER BY event_time_ms DESC
             LIMIT ?
             """,
@@ -271,14 +334,16 @@ class App:
         view_id = first(query, "view_id")
         if not view_id:
             raise ValueError("missing view_id")
-        view = self.db.one("SELECT * FROM pool_views WHERE view_id = ?", (view_id,))
+        view = self.db.one(
+            "SELECT * FROM events WHERE event_kind = 'pool_view_created' AND view_id = ?",
+            (view_id,),
+        )
         members = self.db.rows(
             """
-            SELECT m.*, x.classification, x.last_status, x.details_json
-            FROM pool_view_members m
-            LEFT JOIN extrinsics x ON x.tx_hash = m.tx_hash
-            WHERE m.view_id = ?
-            ORDER BY m.section ASC, m.ordinal ASC
+            SELECT *
+            FROM events
+            WHERE event_kind = 'pool_view_member' AND view_id = ?
+            ORDER BY seq ASC
             LIMIT ?
             """,
             (view_id,),
@@ -291,8 +356,9 @@ class App:
         rows = self.db.rows(
             """
             SELECT *
-            FROM sim_blocks
-            ORDER BY event_time_ms DESC, id DESC
+            FROM events
+            WHERE source = 'chain' AND event_kind = 'block_import'
+            ORDER BY event_time_ms DESC, seq DESC
             LIMIT ?
             """,
             (),
@@ -309,6 +375,10 @@ def dispatch(app: App, path: str, query: dict[str, list[str]]) -> tuple[HTTPStat
             return json_response(app.summary())
         if path == "/api/timeline":
             return json_response(app.timeline(query))
+        if path == "/api/tx-timeline":
+            return json_response(app.tx_timeline(query))
+        if path == "/api/view-timeline":
+            return json_response(app.view_timeline(query))
         if path == "/api/extrinsics":
             return json_response(app.extrinsics(query))
         if path == "/api/extrinsic":
@@ -418,7 +488,7 @@ class AsgiApp:
 
 
 def create_asgi_app() -> AsgiApp:
-    db_path = Path(os.environ.get("AUTHORING_SIM_DB", "authoring-sim.sqlite"))
+    db_path = Path(os.environ.get("EVENT_EXPORT_DB", "event-export.sqlite"))
     return AsgiApp(App(Db(db_path)))
 
 
@@ -430,7 +500,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authoring Sim DB Viewer</title>
+  <title>Event Export DB Viewer</title>
   <style>
     :root {
       color-scheme: dark;
@@ -538,12 +608,14 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <header>
     <div>
-      <h1>Authoring Sim DB Viewer</h1>
+      <h1>Event Export DB Viewer</h1>
       <div id="db-path" class="muted mono"></div>
     </div>
     <div class="tabs">
       <button data-tab="dashboard" class="active">Dashboard</button>
-      <button data-tab="timeline">Timeline</button>
+      <button data-tab="timeline">Event Timeline</button>
+      <button data-tab="txTimeline">Tx Lifetime Timeline</button>
+      <button data-tab="viewTimeline">View Timeline</button>
       <button data-tab="extrinsics">Extrinsics</button>
       <button data-tab="pool">Pool Views</button>
       <button data-tab="blocks">Blocks</button>
@@ -574,12 +646,33 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <section id="tab-timeline" class="hidden">
+      <div class="card section muted">
+        <strong>Slot</strong> is the consensus time slot, not chain height. Use the
+        <strong>block #</strong> column for imported, announced, and simulated block numbers.
+      </div>
       <div class="controls section">
         <input id="timeline-kind" placeholder="filter event_kind">
-        <select id="timeline-limit"><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
+        <select id="timeline-limit"><option>100</option><option selected>200</option><option>500</option><option>1000</option><option>5000</option></select>
         <button id="load-timeline">Load</button>
       </div>
       <div id="timeline-table" class="section"></div>
+    </section>
+
+    <section id="tab-txTimeline" class="hidden">
+      <div class="controls section">
+        <input id="tx-timeline-hash" placeholder="optional tx hash">
+        <select id="tx-timeline-limit"><option>100</option><option selected>200</option><option>500</option><option>1000</option><option>5000</option></select>
+        <button id="load-tx-timeline">Load</button>
+      </div>
+      <div id="tx-timeline-table" class="section"></div>
+    </section>
+
+    <section id="tab-viewTimeline" class="hidden">
+      <div class="controls section">
+        <select id="view-timeline-limit"><option>100</option><option selected>200</option><option>500</option><option>1000</option><option>5000</option></select>
+        <button id="load-view-timeline">Load</button>
+      </div>
+      <div id="view-timeline-table" class="section"></div>
     </section>
 
     <section id="tab-extrinsics" class="hidden">
@@ -647,6 +740,48 @@ function pretty(value) {
   return JSON.stringify(parseJsonMaybe(value), null, 2);
 }
 
+function detailsField(row, field) {
+  const details = parseJsonMaybe(row?.details_json);
+  if (!details || typeof details !== "object") return "";
+  return details[field] ?? "";
+}
+
+function txDetailsField(row, field) {
+  const details = parseJsonMaybe(row?.tx_details_json ?? row?.details_json);
+  if (!details || typeof details !== "object") return "";
+  return details[field] ?? "";
+}
+
+function timelineDetails(row) {
+  const details = parseJsonMaybe(row?.details_json);
+  return details && typeof details === "object" ? details : {};
+}
+
+function timelineBlockNumber(row) {
+  return row.block_number ?? timelineDetails(row).block_number ?? "";
+}
+
+function timelineBlockHash(row) {
+  return row.block_hash ?? timelineDetails(row).block_hash ?? "";
+}
+
+function timelineElapsed(row) {
+  const elapsed = timelineDetails(row).elapsed_ms;
+  return elapsed === undefined || elapsed === null ? "" : `${elapsed} ms`;
+}
+
+function addressCell(value) {
+  if (!value) return "";
+  const s = String(value);
+  return `<span class="mono" title="${escapeHtml(s)}">${escapeHtml(short(s, 10))}</span>`;
+}
+
+function hashCell(value, n = 10) {
+  if (!value) return "";
+  const s = String(value);
+  return `<span class="mono" title="${escapeHtml(s)}">${escapeHtml(short(s, n))}</span>`;
+}
+
 function setError(error) {
   const el = $("error");
   if (!error) {
@@ -705,8 +840,25 @@ async function loadTimeline() {
   qs.set("limit", $("timeline-limit").value);
   if ($("timeline-kind").value) qs.set("kind", $("timeline-kind").value);
   const data = await api(`/api/timeline?${qs}`);
-  $("timeline-table").innerHTML = table(["time", "source", "kind", "tx", "block", "view", "details"], data.rows, r =>
-    `<td>${fmtTime(r.event_time_ms)}</td><td>${r.source}</td><td>${pill(r.event_kind)}</td><td class="mono">${r.tx_hash ? `<button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button>` : ""}</td><td>${r.block_number ?? ""}</td><td class="mono">${r.view_id ? `<button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 10)}</button>` : ""}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
+  $("timeline-table").innerHTML = table(["time", "source", "kind", "slot", "block #", "block hash", "tx", "insertion", "status", "view", "details"], data.rows, r =>
+    `<td>${fmtTime(r.event_time_ms)}</td><td>${r.source}</td><td>${pill(r.event_kind)}</td><td>${r.slot ?? ""}</td><td>${timelineBlockNumber(r)}</td><td>${hashCell(timelineBlockHash(r))}</td><td class="mono">${r.tx_hash ? `<button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button>` : ""}</td><td>${r.insertion_id ?? ""}</td><td>${r.status ? pill(r.status) : ""}</td><td class="mono">${r.view_id ? `<button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 10)}</button>` : ""}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
+}
+
+async function loadTxTimeline() {
+  const qs = new URLSearchParams();
+  qs.set("limit", $("tx-timeline-limit").value);
+  if ($("tx-timeline-hash").value) qs.set("hash", $("tx-timeline-hash").value);
+  const data = await api(`/api/tx-timeline?${qs}`);
+  $("tx-timeline-table").innerHTML = table(["time", "tx", "event", "block #", "view", "section", "ordinal", "insertion", "from", "to", "details"], data.rows, r =>
+    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button></td><td>${pill(r.event_kind)}</td><td>${r.block_number ?? detailsField(r, "view_block_number") ?? ""}</td><td class="mono">${r.view_id ? `<button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 10)}</button>` : ""}</td><td>${r.status ?? detailsField(r, "section")}</td><td>${detailsField(r, "ordinal")}</td><td>${r.insertion_id ?? detailsField(r, "insertion_id") ?? ""}</td><td>${addressCell(txDetailsField(r, "from"))}</td><td>${addressCell(txDetailsField(r, "to"))}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
+}
+
+async function loadViewTimeline() {
+  const qs = new URLSearchParams();
+  qs.set("limit", $("view-timeline-limit").value);
+  const data = await api(`/api/view-timeline?${qs}`);
+  $("view-timeline-table").innerHTML = table(["time", "view", "reason", "trigger tx", "parent block", "build block", "parent hash", "ready", "future", "tx hash / insertion id pairs"], data.rows, r =>
+    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 12)}</button></td><td>${pill(detailsField(r, "reason") ?? r.status ?? "")}</td><td class="mono">${detailsField(r, "trigger_tx_hash") ? `<button onclick="selectExtrinsic('${escapeHtml(detailsField(r, "trigger_tx_hash"))}')">${short(detailsField(r, "trigger_tx_hash"))}</button>` : ""}</td><td>${detailsField(r, "parent_block_number") ?? detailsField(r, "parent_number") ?? ""}</td><td>${detailsField(r, "build_block_number") ?? r.block_number ?? detailsField(r, "view_block_number") ?? ""}</td><td>${hashCell(r.parent_hash)}</td><td>${detailsField(r, "ready_count")}</td><td>${detailsField(r, "future_count")}</td><td class="wrap"><pre>${escapeHtml(pretty(r.members_json))}</pre></td>`);
 }
 
 async function loadExtrinsics() {
@@ -716,8 +868,8 @@ async function loadExtrinsics() {
   if ($("extrinsic-status").value) qs.set("status", $("extrinsic-status").value);
   if ($("extrinsic-class").value) qs.set("classification", $("extrinsic-class").value);
   const data = await api(`/api/extrinsics?${qs}`);
-  $("extrinsics-table").innerHTML = table(["hash", "class", "status", "events", "lifetime", "updated", "details"], data.rows, r =>
-    `<td class="mono"><button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button></td><td>${r.classification}</td><td>${pill(r.last_status)}</td><td>${r.event_count}</td><td>${r.lifetime_ms} ms</td><td>${fmtTime(r.updated_time_ms)}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
+  $("extrinsics-table").innerHTML = table(["hash", "class", "from", "to", "status", "events", "lifetime", "updated", "details"], data.rows, r =>
+    `<td class="mono"><button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button></td><td>${r.classification}</td><td>${addressCell(detailsField(r, "from"))}</td><td>${addressCell(detailsField(r, "to"))}</td><td>${pill(r.last_status)}</td><td>${r.event_count}</td><td>${r.lifetime_ms} ms</td><td>${fmtTime(r.updated_time_ms)}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
 }
 
 async function selectExtrinsic(hash) {
@@ -730,8 +882,8 @@ async function selectExtrinsic(hash) {
     ${table(["time", "kind", "slot", "block", "view", "details"], data.events, r =>
       `<td>${fmtTime(r.event_time_ms)}</td><td>${pill(r.event_kind)}</td><td>${r.slot ?? ""}</td><td>${r.block_number ?? ""}</td><td class="mono">${r.view_id ? `<button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 10)}</button>` : ""}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`)}
     <h4>Pool View Membership</h4>
-    ${table(["time", "section", "ordinal", "slot", "reason"], data.views, r =>
-      `<td>${fmtTime(r.event_time_ms)}</td><td>${r.section}</td><td>${r.ordinal}</td><td>${r.slot ?? ""}</td><td>${r.reason}</td>`)}
+    ${table(["time", "section", "ordinal", "insertion", "view block"], data.views, r =>
+      `<td>${fmtTime(r.event_time_ms)}</td><td>${r.status ?? detailsField(r, "section")}</td><td>${detailsField(r, "ordinal")}</td><td>${r.insertion_id ?? detailsField(r, "insertion_id") ?? ""}</td><td>${r.block_number ?? detailsField(r, "view_block_number") ?? ""}</td>`)}
   `;
 }
 
@@ -740,7 +892,7 @@ async function loadPoolViews() {
   qs.set("limit", $("pool-limit").value);
   const data = await api(`/api/pool-views?${qs}`);
   $("pool-table").innerHTML = table(["time", "view", "slot", "parent", "ready", "future", "reason"], data.rows, r =>
-    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 12)}</button></td><td>${r.slot ?? ""}</td><td>${r.parent_number}</td><td>${r.ready_count}</td><td>${r.future_count}</td><td>${r.reason}</td>`);
+    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 12)}</button></td><td>${r.slot ?? ""}</td><td>${detailsField(r, "parent_number")}</td><td>${detailsField(r, "ready_count")}</td><td>${detailsField(r, "future_count")}</td><td>${r.status ?? detailsField(r, "reason")}</td>`);
 }
 
 async function selectPoolView(viewId) {
@@ -750,8 +902,8 @@ async function selectPoolView(viewId) {
   $("pool-detail").innerHTML = `
     <div class="muted">view</div><pre class="details">${escapeHtml(pretty(data.view))}</pre>
     <h4>Members</h4>
-    ${table(["section", "ordinal", "hash", "priority", "class", "status", "provides"], data.members, r =>
-      `<td>${r.section}</td><td>${r.ordinal}</td><td class="mono"><button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button></td><td>${r.priority ?? ""}</td><td>${r.classification ?? ""}</td><td>${pill(r.last_status)}</td><td class="wrap">${escapeHtml(r.provides_json)}</td>`)}
+    ${table(["section", "ordinal", "hash", "priority", "status", "details"], data.members, r =>
+      `<td>${detailsField(r, "section")}</td><td>${detailsField(r, "ordinal")}</td><td class="mono"><button onclick="selectExtrinsic('${escapeHtml(r.tx_hash)}')">${short(r.tx_hash)}</button></td><td>${detailsField(r, "priority")}</td><td>${pill(r.status)}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`)}
   `;
 }
 
@@ -759,13 +911,13 @@ async function loadBlocks() {
   const qs = new URLSearchParams();
   qs.set("limit", $("blocks-limit").value);
   const data = await api(`/api/blocks?${qs}`);
-  $("blocks-table").innerHTML = table(["time", "slot", "parent", "block", "duration", "result", "error"], data.rows, r =>
-    `<td>${fmtTime(r.event_time_ms)}</td><td>${r.slot}</td><td>${r.parent_number}</td><td>${r.block_number ?? ""}</td><td>${r.duration_ms} ms</td><td>${pill(r.result)}</td><td class="wrap">${escapeHtml(r.error ?? "")}</td>`);
+  $("blocks-table").innerHTML = table(["time", "kind", "block #", "block hash", "new best", "origin", "details"], data.rows, r =>
+    `<td>${fmtTime(r.event_time_ms)}</td><td>${pill(r.event_kind)}</td><td>${r.block_number ?? ""}</td><td>${hashCell(r.block_hash)}</td><td>${detailsField(r, "is_new_best")}</td><td>${r.status ?? ""}</td><td class="wrap"><pre>${escapeHtml(pretty(r.details_json))}</pre></td>`);
 }
 
 function showTab(tab) {
   state.tab = tab;
-  for (const name of ["dashboard", "timeline", "extrinsics", "pool", "blocks"]) {
+  for (const name of ["dashboard", "timeline", "txTimeline", "viewTimeline", "extrinsics", "pool", "blocks"]) {
     $(`tab-${name}`).classList.toggle("hidden", name !== tab);
     document.querySelector(`[data-tab="${name}"]`).classList.toggle("active", name === tab);
   }
@@ -777,6 +929,8 @@ async function refresh() {
   try {
     if (state.tab === "dashboard") await loadDashboard();
     if (state.tab === "timeline") await loadTimeline();
+    if (state.tab === "txTimeline") await loadTxTimeline();
+    if (state.tab === "viewTimeline") await loadViewTimeline();
     if (state.tab === "extrinsics") await loadExtrinsics();
     if (state.tab === "pool") await loadPoolViews();
     if (state.tab === "blocks") await loadBlocks();
@@ -790,6 +944,8 @@ for (const btn of document.querySelectorAll("[data-tab]")) {
 }
 $("refresh").addEventListener("click", refresh);
 $("load-timeline").addEventListener("click", loadTimeline);
+$("load-tx-timeline").addEventListener("click", loadTxTimeline);
+$("load-view-timeline").addEventListener("click", loadViewTimeline);
 $("load-extrinsics").addEventListener("click", loadExtrinsics);
 $("load-pool").addEventListener("click", loadPoolViews);
 $("load-blocks").addEventListener("click", loadBlocks);
@@ -806,8 +962,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path("authoring-sim.sqlite"),
-        help="Path to the authoring simulation SQLite database.",
+        default=Path("event-export.sqlite"),
+        help="Path to the event export SQLite database.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host.")
     parser.add_argument("--port", type=int, default=8787, help="Bind port.")
@@ -822,7 +978,7 @@ def main() -> None:
     Handler.app = App(Db(args.db))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
-    print(f"Authoring sim DB viewer: {url}")
+    print(f"Event export DB viewer: {url}")
     print(f"Reading: {args.db.resolve()}")
     try:
         server.serve_forever()

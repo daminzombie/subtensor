@@ -1,8 +1,8 @@
 //! Service and ServiceFactory implementation. Specialized wrapper over substrate service.
 
-use crate::authoring_sim::{AuthoringSimulationConfig, spawn_authoring_simulation};
-use crate::cli::AuthoringSimulationCli;
+use crate::cli::EventExportCli;
 use crate::consensus::ConsensusMechanism;
+use crate::event_export::{self, EventExportConfig, SharedEventSink, spawn_event_export};
 use futures::{FutureExt, channel::mpsc, future};
 use node_subtensor_runtime::{RuntimeApi, TransactionConverter, opaque::Block};
 use sc_chain_spec::ChainType;
@@ -261,7 +261,7 @@ pub async fn new_full<NB, CM>(
     mut config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
-    authoring_sim: AuthoringSimulationCli,
+    event_export: EventExportCli,
     custom_service_signal: Option<Arc<AtomicBool>>,
     skip_history_backfill: bool,
 ) -> Result<TaskManager, ServiceError>
@@ -279,7 +279,7 @@ where
         return Err(ServiceError::Other("Unsupported sync mode".to_string()));
     }
 
-    let authoring_sim = resolve_authoring_sim_config(&config, authoring_sim);
+    let event_export = resolve_event_export_config(&config, event_export);
     let mut consensus_mechanism = CM::new();
     let build_import_queue = consensus_mechanism.build_biq(skip_history_backfill)?;
 
@@ -346,6 +346,8 @@ where
         Some(WarpSyncConfig::WithProvider(warp_sync))
     };
 
+    let event_export_announce_sink = event_export.as_ref().map(|_| SharedEventSink::new());
+
     let (network, system_rpc_tx, tx_handler_controller, sync_service) =
         sc_service::build_network(sc_service::BuildNetworkParams {
             config: &config,
@@ -354,7 +356,9 @@ where
             transaction_pool: transaction_pool.clone(),
             spawn_handle: task_manager.spawn_handle(),
             import_queue,
-            block_announce_validator_builder: None,
+            block_announce_validator_builder: event_export_announce_sink
+                .clone()
+                .map(event_export::block_announce_validator_builder),
             warp_sync_config,
             block_relay: None,
             metrics,
@@ -546,24 +550,13 @@ where
     )
     .await;
 
-    if let Some(authoring_sim) = authoring_sim {
-        if role.is_authority() {
-            log::warn!(
-                target: LOG_TARGET,
-                "`--authoring-sim` is enabled while the node role is authority; real authoring remains enabled."
-            );
-        }
-
-        let slot_duration = consensus_mechanism.slot_duration(&client)?;
-        spawn_authoring_simulation::<CM>(
+    if let Some(event_export) = event_export {
+        spawn_event_export(
             &task_manager,
-            authoring_sim,
+            event_export,
             client.clone(),
             transaction_pool.clone(),
-            select_chain.clone(),
-            slot_duration,
-            prometheus_registry.as_ref(),
-            telemetry.as_ref().map(|x| x.handle()),
+            event_export_announce_sink.clone(),
         )?;
     }
 
@@ -686,7 +679,7 @@ pub async fn build_full<CM: ConsensusMechanism + Send + 'static>(
     config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
-    authoring_sim: AuthoringSimulationCli,
+    event_export: EventExportCli,
     custom_service_signal: Option<Arc<AtomicBool>>,
     skip_history_backfill: bool,
 ) -> Result<TaskManager, ServiceError> {
@@ -696,7 +689,7 @@ pub async fn build_full<CM: ConsensusMechanism + Send + 'static>(
                 config,
                 eth_config,
                 sealing,
-                authoring_sim,
+                event_export,
                 custom_service_signal,
                 skip_history_backfill,
             )
@@ -707,7 +700,7 @@ pub async fn build_full<CM: ConsensusMechanism + Send + 'static>(
                 config,
                 eth_config,
                 sealing,
-                authoring_sim,
+                event_export,
                 custom_service_signal,
                 skip_history_backfill,
             )
@@ -716,15 +709,15 @@ pub async fn build_full<CM: ConsensusMechanism + Send + 'static>(
     }
 }
 
-fn resolve_authoring_sim_config(
+fn resolve_event_export_config(
     config: &Configuration,
-    cli: AuthoringSimulationCli,
-) -> Option<AuthoringSimulationConfig> {
+    cli: EventExportCli,
+) -> Option<EventExportConfig> {
     cli.enabled.then(|| {
         let db_path = cli
             .db
-            .unwrap_or_else(|| db_config_dir(config).join("authoring-sim.sqlite"));
-        AuthoringSimulationConfig {
+            .unwrap_or_else(|| db_config_dir(config).join("event-export.sqlite"));
+        EventExportConfig {
             db_path,
             log_xt_data: cli.log_xt_data,
             channel_capacity: cli.channel_capacity,

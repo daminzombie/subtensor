@@ -1,7 +1,6 @@
 //! Substrate Node Subtensor CLI library.
 #![warn(missing_docs)]
 
-mod authoring_sim;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 mod chain_spec;
@@ -12,6 +11,7 @@ mod command;
 mod conditional_evm_block_import;
 mod consensus;
 mod ethereum;
+mod event_export;
 mod rpc;
 mod service;
 

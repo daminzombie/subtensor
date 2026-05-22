@@ -1,4 +1,3 @@
-pub mod authoring_sim;
 pub mod chain_spec;
 pub mod cli;
 pub mod client;
@@ -6,5 +5,6 @@ pub mod clone_spec;
 pub mod conditional_evm_block_import;
 pub mod consensus;
 pub mod ethereum;
+pub mod event_export;
 pub mod rpc;
 pub mod service;

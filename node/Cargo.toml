@@ -74,6 +74,7 @@ frame-support.workspace = true
 pallet-balances.workspace = true
 pallet-transaction-payment.workspace = true
 pallet-ethereum.workspace = true
+ethereum.workspace = true
 pallet-commitments.workspace = true
 pallet-drand.workspace = true
 sp-crypto-ec-utils = { workspace = true, default-features = true, features = [
