@@ -4,15 +4,20 @@ Local web UI for inspecting event export SQLite databases.
 
 Usage:
     python3 scripts/event_export_ui.py --db /path/to/event-export.sqlite
+    python3 scripts/event_export_ui.py --db /path/to/event-export.sqlite --retention-minutes 30 --prune-interval-seconds 180
     EVENT_EXPORT_DB=/var/lib/subtensor/chains/bittensor/event-export.sqlite uvicorn scripts.event_export_ui:asgi_app --host 0.0.0.0 --port 8787
+    EVENT_EXPORT_RETENTION_MINUTES=30 EVENT_EXPORT_PRUNE_INTERVAL_SECONDS=180 uvicorn scripts.event_export_ui:asgi_app --host 0.0.0.0 --port 8787
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sqlite3
+import threading
+import time
 import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +27,11 @@ from typing import Any
 
 DEFAULT_LIMIT = 200
 MAX_LIMIT = 5000
+DEFAULT_PRUNE_INTERVAL_SECONDS = 180
+DEFAULT_RETENTION_MINUTES = 5
+DEFAULT_PRUNE_BATCH_SIZE = 5_000
+DEFAULT_DB_PATH = Path("/var/lib/subtensor/chains/bittensor/event-export.sqlite")
+DEFAULT_VIEW_TIMELINE_BLOCKS = 10
 
 
 def clamp_limit(value: str | None, default: int = DEFAULT_LIMIT) -> int:
@@ -29,6 +39,15 @@ def clamp_limit(value: str | None, default: int = DEFAULT_LIMIT) -> int:
         return default
     try:
         return max(1, min(MAX_LIMIT, int(value)))
+    except ValueError:
+        return default
+
+
+def parse_int(value: str | None, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
     except ValueError:
         return default
 
@@ -51,9 +70,10 @@ class Db:
     def __init__(self, path: Path):
         self.path = path.resolve()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self, readonly: bool = True, timeout: float = 1.0) -> sqlite3.Connection:
         uri_path = urllib.parse.quote(str(self.path), safe="/:")
-        conn = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=1.0)
+        mode = "ro" if readonly else "rw"
+        conn = sqlite3.connect(f"file:{uri_path}?mode={mode}", uri=True, timeout=timeout)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -79,6 +99,57 @@ class Db:
         with self.connect() as conn:
             row = conn.execute(sql, params).fetchone()
             return None if row is None else row[0]
+
+    def prune_before(self, cutoff_time_ms: int, batch_size: int) -> int:
+        with self.connect(readonly=False, timeout=0.25) as conn:
+            conn.execute("PRAGMA busy_timeout = 250")
+            cursor = conn.execute(
+                """
+                DELETE FROM events
+                WHERE seq IN (
+                    SELECT seq
+                    FROM events
+                    WHERE event_time_ms < ?
+                    ORDER BY event_time_ms
+                    LIMIT ?
+                )
+                """,
+                (cutoff_time_ms, batch_size),
+            )
+            deleted = cursor.rowcount if cursor.rowcount is not None else 0
+            return deleted
+
+
+def is_sqlite_lock_error(error: sqlite3.OperationalError) -> bool:
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def prune_once(db: Db, retention_minutes: int, batch_size: int) -> int:
+    cutoff_time_ms = int(time.time() * 1000) - retention_minutes * 60_000
+    return db.prune_before(cutoff_time_ms, batch_size)
+
+
+def run_prune_loop(
+    db: Db,
+    retention_minutes: int,
+    interval_seconds: int,
+    batch_size: int,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.wait(interval_seconds):
+        try:
+            deleted = prune_once(db, retention_minutes, batch_size)
+            if deleted:
+                print(
+                    f"Pruned {deleted} events older than {retention_minutes} minutes "
+                    f"from {db.path}"
+                )
+        except sqlite3.OperationalError as error:
+            if not is_sqlite_lock_error(error):
+                print(f"Skipped event DB prune: {error}")
+        except Exception as error:
+            print(f"Event DB prune failed: {error}")
 
 
 class App:
@@ -187,18 +258,90 @@ class App:
         return {"rows": rows, "limit": limit}
 
     def view_timeline(self, query: dict[str, list[str]]) -> dict[str, Any]:
-        limit = clamp_limit(first(query, "limit"))
-        rows = self.db.rows(
-            """
-            SELECT *
-            FROM events
-            WHERE event_kind = 'pool_view_created'
-            ORDER BY event_time_ms DESC, seq DESC
-            LIMIT ?
-            """,
-            (),
-            limit,
-        )
+        limit = clamp_limit(first(query, "limit"), MAX_LIMIT)
+        blocks = parse_int(first(query, "blocks"), DEFAULT_VIEW_TIMELINE_BLOCKS)
+        parent_block = parse_int(first(query, "parent_block"))
+        build_block = parse_int(first(query, "build_block"))
+        from_block = parse_int(first(query, "from_block"))
+        to_block = parse_int(first(query, "to_block"))
+        parent_expr = """
+            COALESCE(
+                CAST(json_extract(details_json, '$.parent_block_number') AS INTEGER),
+                CAST(json_extract(details_json, '$.parent_number') AS INTEGER),
+                block_number - 1
+            )
+        """
+        build_expr = """
+            COALESCE(
+                CAST(json_extract(details_json, '$.build_block_number') AS INTEGER),
+                CAST(json_extract(details_json, '$.view_block_number') AS INTEGER),
+                block_number
+            )
+        """
+
+        if any(value is not None for value in (parent_block, build_block, from_block, to_block)):
+            where = []
+            params: list[Any] = []
+            if parent_block is not None:
+                where.append("parent_block_number = ?")
+                params.append(parent_block)
+            if build_block is not None:
+                where.append("build_block_number = ?")
+                params.append(build_block)
+            if from_block is not None:
+                where.append("parent_block_number >= ?")
+                params.append(from_block)
+            if to_block is not None:
+                where.append("parent_block_number <= ?")
+                params.append(to_block)
+            rows = self.db.rows(
+                f"""
+                WITH views AS (
+                    SELECT
+                        *,
+                        {parent_expr} AS parent_block_number,
+                        {build_expr} AS build_block_number
+                    FROM events
+                    WHERE event_kind = 'pool_view_created'
+                )
+                SELECT *
+                FROM views
+                WHERE {' AND '.join(where)}
+                ORDER BY parent_block_number DESC, event_time_ms DESC, seq DESC
+                LIMIT ?
+                """,
+                tuple(params),
+                limit,
+            )
+        else:
+            rows = self.db.rows(
+                f"""
+                WITH views AS (
+                    SELECT
+                        *,
+                        {parent_expr} AS parent_block_number,
+                        {build_expr} AS build_block_number
+                    FROM events
+                    WHERE event_kind = 'pool_view_created'
+                ),
+                recent_parent_blocks AS (
+                    SELECT DISTINCT parent_block_number
+                    FROM views
+                    WHERE parent_block_number IS NOT NULL
+                    ORDER BY parent_block_number DESC
+                    LIMIT ?
+                )
+                SELECT *
+                FROM views
+                WHERE parent_block_number IN (
+                    SELECT parent_block_number FROM recent_parent_blocks
+                )
+                ORDER BY parent_block_number DESC, event_time_ms DESC, seq DESC
+                LIMIT ?
+                """,
+                (max(1, blocks or DEFAULT_VIEW_TIMELINE_BLOCKS),),
+                limit,
+            )
         for row in rows:
             members = self.db.rows(
                 """
@@ -225,7 +368,15 @@ class App:
                     for member in members
                 ]
             )
-        return {"rows": rows, "limit": limit}
+        return {
+            "rows": rows,
+            "limit": limit,
+            "blocks": blocks,
+            "parent_block": parent_block,
+            "build_block": build_block,
+            "from_block": from_block,
+            "to_block": to_block,
+        }
 
     def extrinsics(self, query: dict[str, list[str]]) -> dict[str, Any]:
         limit = clamp_limit(first(query, "limit"))
@@ -436,8 +587,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class AsgiApp:
-    def __init__(self, app: App):
+    def __init__(
+        self,
+        app: App,
+        retention_minutes: int,
+        prune_interval_seconds: int,
+        prune_batch_size: int,
+    ):
         self.app = app
+        self.retention_minutes = retention_minutes
+        self.prune_interval_seconds = prune_interval_seconds
+        self.prune_batch_size = prune_batch_size
+        self._prune_task: asyncio.Task[Any] | None = None
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -465,10 +626,48 @@ class AsgiApp:
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
+                self.start_pruner()
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
+                await self.stop_pruner()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    def start_pruner(self) -> None:
+        if self.retention_minutes <= 0 or self.prune_interval_seconds <= 0:
+            return
+        if self._prune_task is None or self._prune_task.done():
+            self._prune_task = asyncio.create_task(self.prune_loop())
+
+    async def stop_pruner(self) -> None:
+        if self._prune_task is None:
+            return
+        self._prune_task.cancel()
+        try:
+            await self._prune_task
+        except asyncio.CancelledError:
+            pass
+
+    async def prune_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.prune_interval_seconds)
+            try:
+                deleted = await asyncio.to_thread(
+                    prune_once,
+                    self.app.db,
+                    self.retention_minutes,
+                    self.prune_batch_size,
+                )
+                if deleted:
+                    print(
+                        f"Pruned {deleted} events older than {self.retention_minutes} "
+                        f"minutes from {self.app.db.path}"
+                    )
+            except sqlite3.OperationalError as error:
+                if not is_sqlite_lock_error(error):
+                    print(f"Skipped event DB prune: {error}")
+            except Exception as error:
+                print(f"Event DB prune failed: {error}")
 
     async def send_response(
         self, send: Any, status: HTTPStatus, content_type: str, body: bytes
@@ -488,8 +687,24 @@ class AsgiApp:
 
 
 def create_asgi_app() -> AsgiApp:
-    db_path = Path(os.environ.get("EVENT_EXPORT_DB", "event-export.sqlite"))
-    return AsgiApp(App(Db(db_path)))
+    db_path = Path(os.environ.get("EVENT_EXPORT_DB", DEFAULT_DB_PATH))
+    retention_minutes = int(
+        os.environ.get("EVENT_EXPORT_RETENTION_MINUTES", DEFAULT_RETENTION_MINUTES)
+    )
+    prune_interval_seconds = int(
+        os.environ.get(
+            "EVENT_EXPORT_PRUNE_INTERVAL_SECONDS", DEFAULT_PRUNE_INTERVAL_SECONDS
+        )
+    )
+    prune_batch_size = int(
+        os.environ.get("EVENT_EXPORT_PRUNE_BATCH_SIZE", DEFAULT_PRUNE_BATCH_SIZE)
+    )
+    return AsgiApp(
+        App(Db(db_path)),
+        retention_minutes,
+        prune_interval_seconds,
+        prune_batch_size,
+    )
 
 
 asgi_app = create_asgi_app()
@@ -669,7 +884,12 @@ INDEX_HTML = r"""<!doctype html>
 
     <section id="tab-viewTimeline" class="hidden">
       <div class="controls section">
-        <select id="view-timeline-limit"><option>100</option><option selected>200</option><option>500</option><option>1000</option><option>5000</option></select>
+        <input id="view-timeline-blocks" placeholder="latest parent blocks" value="10">
+        <input id="view-timeline-parent-block" placeholder="parent block N">
+        <input id="view-timeline-build-block" placeholder="build block N+1">
+        <input id="view-timeline-from-block" placeholder="from parent block">
+        <input id="view-timeline-to-block" placeholder="to parent block">
+        <select id="view-timeline-limit"><option>100</option><option>200</option><option>500</option><option>1000</option><option selected>5000</option></select>
         <button id="load-view-timeline">Load</button>
       </div>
       <div id="view-timeline-table" class="section"></div>
@@ -856,9 +1076,14 @@ async function loadTxTimeline() {
 async function loadViewTimeline() {
   const qs = new URLSearchParams();
   qs.set("limit", $("view-timeline-limit").value);
+  if ($("view-timeline-blocks").value) qs.set("blocks", $("view-timeline-blocks").value);
+  if ($("view-timeline-parent-block").value) qs.set("parent_block", $("view-timeline-parent-block").value);
+  if ($("view-timeline-build-block").value) qs.set("build_block", $("view-timeline-build-block").value);
+  if ($("view-timeline-from-block").value) qs.set("from_block", $("view-timeline-from-block").value);
+  if ($("view-timeline-to-block").value) qs.set("to_block", $("view-timeline-to-block").value);
   const data = await api(`/api/view-timeline?${qs}`);
   $("view-timeline-table").innerHTML = table(["time", "view", "reason", "trigger tx", "parent block", "build block", "parent hash", "ready", "future", "tx hash / insertion id pairs"], data.rows, r =>
-    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 12)}</button></td><td>${pill(detailsField(r, "reason") ?? r.status ?? "")}</td><td class="mono">${detailsField(r, "trigger_tx_hash") ? `<button onclick="selectExtrinsic('${escapeHtml(detailsField(r, "trigger_tx_hash"))}')">${short(detailsField(r, "trigger_tx_hash"))}</button>` : ""}</td><td>${detailsField(r, "parent_block_number") ?? detailsField(r, "parent_number") ?? ""}</td><td>${detailsField(r, "build_block_number") ?? r.block_number ?? detailsField(r, "view_block_number") ?? ""}</td><td>${hashCell(r.parent_hash)}</td><td>${detailsField(r, "ready_count")}</td><td>${detailsField(r, "future_count")}</td><td class="wrap"><pre>${escapeHtml(pretty(r.members_json))}</pre></td>`);
+    `<td>${fmtTime(r.event_time_ms)}</td><td class="mono"><button onclick="selectPoolView('${escapeHtml(r.view_id)}')">${short(r.view_id, 12)}</button></td><td>${pill(detailsField(r, "reason") ?? r.status ?? "")}</td><td class="mono">${detailsField(r, "trigger_tx_hash") ? `<button onclick="selectExtrinsic('${escapeHtml(detailsField(r, "trigger_tx_hash"))}')">${short(detailsField(r, "trigger_tx_hash"))}</button>` : ""}</td><td>${r.parent_block_number ?? detailsField(r, "parent_block_number") ?? detailsField(r, "parent_number") ?? ""}</td><td>${r.build_block_number ?? detailsField(r, "build_block_number") ?? r.block_number ?? detailsField(r, "view_block_number") ?? ""}</td><td>${hashCell(r.parent_hash)}</td><td>${detailsField(r, "ready_count")}</td><td>${detailsField(r, "future_count")}</td><td class="wrap"><pre>${escapeHtml(pretty(r.members_json))}</pre></td>`);
 }
 
 async function loadExtrinsics() {
@@ -962,11 +1187,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path("event-export.sqlite"),
+        default=DEFAULT_DB_PATH,
         help="Path to the event export SQLite database.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host.")
     parser.add_argument("--port", type=int, default=8787, help="Bind port.")
+    parser.add_argument(
+        "--retention-minutes",
+        type=int,
+        default=DEFAULT_RETENTION_MINUTES,
+        help=(
+            "Keep only events newer than this many minutes. "
+            "Set to 0 to disable pruning."
+        ),
+    )
+    parser.add_argument(
+        "--prune-interval-seconds",
+        type=int,
+        default=DEFAULT_PRUNE_INTERVAL_SECONDS,
+        help="How often to delete old events while the server is running.",
+    )
+    parser.add_argument(
+        "--prune-batch-size",
+        type=int,
+        default=DEFAULT_PRUNE_BATCH_SIZE,
+        help="Maximum number of old event rows to delete per prune pass.",
+    )
     return parser.parse_args()
 
 
@@ -975,16 +1221,40 @@ def main() -> None:
     if not args.db.exists():
         raise SystemExit(f"database does not exist: {args.db}")
 
-    Handler.app = App(Db(args.db))
+    db = Db(args.db)
+    Handler.app = App(db)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    stop_pruner = threading.Event()
+    pruner: threading.Thread | None = None
     url = f"http://{args.host}:{args.port}"
     print(f"Event export DB viewer: {url}")
     print(f"Reading: {args.db.resolve()}")
+    if args.retention_minutes > 0 and args.prune_interval_seconds > 0:
+        print(
+            "Pruning events older than "
+            f"{args.retention_minutes} minutes every "
+            f"{args.prune_interval_seconds} seconds"
+        )
+        pruner = threading.Thread(
+            target=run_prune_loop,
+            args=(
+                db,
+                args.retention_minutes,
+                args.prune_interval_seconds,
+                args.prune_batch_size,
+                stop_pruner,
+            ),
+            daemon=True,
+        )
+        pruner.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
+        stop_pruner.set()
+        if pruner is not None:
+            pruner.join(timeout=1.0)
         server.server_close()
 
 
