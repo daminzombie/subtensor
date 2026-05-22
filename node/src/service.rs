@@ -1,5 +1,7 @@
 //! Service and ServiceFactory implementation. Specialized wrapper over substrate service.
 
+use crate::authoring_sim::{AuthoringSimulationConfig, spawn_authoring_simulation};
+use crate::cli::AuthoringSimulationCli;
 use crate::consensus::ConsensusMechanism;
 use futures::{FutureExt, channel::mpsc, future};
 use node_subtensor_runtime::{RuntimeApi, TransactionConverter, opaque::Block};
@@ -259,13 +261,14 @@ pub async fn new_full<NB, CM>(
     mut config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
+    authoring_sim: AuthoringSimulationCli,
     custom_service_signal: Option<Arc<AtomicBool>>,
     skip_history_backfill: bool,
 ) -> Result<TaskManager, ServiceError>
 where
     NumberFor<Block>: BlockNumberOps,
     NB: sc_network::NetworkBackend<Block, <Block as BlockT>::Hash>,
-    CM: ConsensusMechanism,
+    CM: ConsensusMechanism + Send + 'static,
 {
     // Substrate doesn't seem to support fast sync option in our configuration.
     if matches!(config.network.sync_mode, SyncMode::LightState { .. }) {
@@ -276,6 +279,7 @@ where
         return Err(ServiceError::Other("Unsupported sync mode".to_string()));
     }
 
+    let authoring_sim = resolve_authoring_sim_config(&config, authoring_sim);
     let mut consensus_mechanism = CM::new();
     let build_import_queue = consensus_mechanism.build_biq(skip_history_backfill)?;
 
@@ -542,6 +546,27 @@ where
     )
     .await;
 
+    if let Some(authoring_sim) = authoring_sim {
+        if role.is_authority() {
+            log::warn!(
+                target: LOG_TARGET,
+                "`--authoring-sim` is enabled while the node role is authority; real authoring remains enabled."
+            );
+        }
+
+        let slot_duration = consensus_mechanism.slot_duration(&client)?;
+        spawn_authoring_simulation::<CM>(
+            &task_manager,
+            authoring_sim,
+            client.clone(),
+            transaction_pool.clone(),
+            select_chain.clone(),
+            slot_duration,
+            prometheus_registry.as_ref(),
+            telemetry.as_ref().map(|x| x.handle()),
+        )?;
+    }
+
     if role.is_authority() {
         let shield_keystore = Arc::new(MemoryShieldKeystore::new());
 
@@ -657,10 +682,11 @@ where
     Ok(task_manager)
 }
 
-pub async fn build_full<CM: ConsensusMechanism>(
+pub async fn build_full<CM: ConsensusMechanism + Send + 'static>(
     config: Configuration,
     eth_config: EthConfiguration,
     sealing: Option<Sealing>,
+    authoring_sim: AuthoringSimulationCli,
     custom_service_signal: Option<Arc<AtomicBool>>,
     skip_history_backfill: bool,
 ) -> Result<TaskManager, ServiceError> {
@@ -670,6 +696,7 @@ pub async fn build_full<CM: ConsensusMechanism>(
                 config,
                 eth_config,
                 sealing,
+                authoring_sim,
                 custom_service_signal,
                 skip_history_backfill,
             )
@@ -680,12 +707,29 @@ pub async fn build_full<CM: ConsensusMechanism>(
                 config,
                 eth_config,
                 sealing,
+                authoring_sim,
                 custom_service_signal,
                 skip_history_backfill,
             )
             .await
         }
     }
+}
+
+fn resolve_authoring_sim_config(
+    config: &Configuration,
+    cli: AuthoringSimulationCli,
+) -> Option<AuthoringSimulationConfig> {
+    cli.enabled.then(|| {
+        let db_path = cli
+            .db
+            .unwrap_or_else(|| db_config_dir(config).join("authoring-sim.sqlite"));
+        AuthoringSimulationConfig {
+            db_path,
+            log_xt_data: cli.log_xt_data,
+            channel_capacity: cli.channel_capacity,
+        }
+    })
 }
 
 pub fn new_chain_ops<CM: ConsensusMechanism>(

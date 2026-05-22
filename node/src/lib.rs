@@ -1,3 +1,4 @@
+pub mod authoring_sim;
 pub mod chain_spec;
 pub mod cli;
 pub mod client;

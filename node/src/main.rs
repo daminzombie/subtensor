@@ -1,6 +1,7 @@
 //! Substrate Node Subtensor CLI library.
 #![warn(missing_docs)]
 
+mod authoring_sim;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarking;
 mod chain_spec;

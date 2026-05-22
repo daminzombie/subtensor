@@ -27,9 +27,13 @@ use sp_consensus::{Environment, Proposer, SelectChain, SyncOracle};
 use sp_consensus_aura::AuraApi;
 use sp_consensus_aura::sr25519::AuthorityId;
 use sp_consensus_babe::BabeApi;
+use sp_consensus_babe::digests::{
+    CompatibleDigestItem, PreDigest, SecondaryPlainPreDigest,
+};
 use sp_consensus_slots::SlotDuration;
 use sp_inherents::CreateInherentDataProviders;
 use sp_keystore::KeystorePtr;
+use sp_runtime::{Digest, DigestItem};
 use sp_runtime::traits::NumberFor;
 use stc_shield::InherentDataProvider as ShieldInherentDataProvider;
 use std::{error::Error, sync::Arc};
@@ -143,6 +147,17 @@ impl ConsensusMechanism for BabeConsensus {
             );
         let shield = ShieldInherentDataProvider::new(shield_keystore);
         Ok((slot, timestamp, shield))
+    }
+
+    fn simulation_pre_digest(slot: sp_consensus_slots::Slot) -> Digest {
+        Digest {
+            logs: vec![<DigestItem as CompatibleDigestItem>::babe_pre_digest(
+                PreDigest::SecondaryPlain(SecondaryPlainPreDigest {
+                    slot: slot.into(),
+                    authority_index: 0,
+                }),
+            )],
+        }
     }
 
     fn new() -> Self {

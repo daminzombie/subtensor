@@ -36,6 +36,9 @@ pub struct Cli {
     #[command(flatten)]
     pub eth: EthConfiguration,
 
+    #[command(flatten)]
+    pub authoring_sim: AuthoringSimulationCli,
+
     /// Control historical gap-backfill during initial/catch-up sync.
     ///
     /// `keep` preserves complete history (default for normal node runs).
@@ -43,6 +46,32 @@ pub struct Cli {
     /// For `build-patched-spec`, the implicit default is `skip` unless this flag is explicitly set.
     #[arg(long, value_enum, default_value_t = HistoryBackfill::Keep)]
     pub history_backfill: HistoryBackfill,
+}
+
+/// Configuration flags for local authoring simulation.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct AuthoringSimulationCli {
+    /// Build a local candidate block every slot and record txpool/block-building diagnostics.
+    #[arg(
+        long = "authoring-sim",
+        id = "authoring-sim-enabled",
+        action = clap::ArgAction::SetTrue
+    )]
+    pub enabled: bool,
+
+    /// SQLite database path for authoring simulation diagnostics.
+    ///
+    /// Defaults to `<base-path>/<chain-id>/authoring-sim.sqlite`.
+    #[arg(long = "authoring-sim-db", value_name = "PATH")]
+    pub db: Option<PathBuf>,
+
+    /// Include full encoded extrinsic bytes in the authoring simulation database.
+    #[arg(long = "authoring-sim-log-xt-data", default_value_t = true)]
+    pub log_xt_data: bool,
+
+    /// Number of events buffered before instrumentation starts dropping diagnostics.
+    #[arg(long = "authoring-sim-channel-capacity", default_value_t = 100_000)]
+    pub channel_capacity: usize,
 }
 
 #[allow(clippy::large_enum_variant)]

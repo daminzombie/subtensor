@@ -19,6 +19,7 @@ use sp_consensus::{Environment, SelectChain};
 use sp_consensus_aura::sr25519::AuthorityId as AuraAuthorityId;
 use sp_consensus_babe::BabeApi;
 use sp_consensus_slots::SlotDuration;
+use sp_runtime::Digest;
 use sp_inherents::CreateInherentDataProviders;
 use sp_keystore::KeystorePtr;
 use sp_runtime::traits::NumberFor;
@@ -94,6 +95,12 @@ pub trait ConsensusMechanism {
         slot_duration: SlotDuration,
         shield_keystore: ShieldKeystorePtr,
     ) -> Result<Self::InherentDataProviders, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Build the pre-runtime digest used by local authoring simulation.
+    ///
+    /// This intentionally bypasses real claim/signature checks because the simulation builds and
+    /// drops candidate blocks only for diagnostics.
+    fn simulation_pre_digest(slot: sp_consensus_slots::Slot) -> Digest;
 
     /// Creates the frontier consensus data provider with this mechanism.
     fn frontier_consensus_data_provider(

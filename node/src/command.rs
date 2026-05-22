@@ -289,6 +289,7 @@ fn start_babe_service(
             config,
             cli.eth,
             cli.sealing,
+            cli.authoring_sim,
             None,
             skip_history_backfill,
         )
@@ -344,6 +345,7 @@ fn start_aura_service(
             config,
             cli.eth,
             cli.sealing,
+            cli.authoring_sim,
             Some(custom_service_signal_clone),
             skip_history_backfill,
         )

@@ -26,7 +26,9 @@ clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true, features = ["thread-pool"] }
 serde = { workspace = true, features = ["derive"] }
 hex.workspace = true
-tokio = { workspace = true, features = ["time", "rt", "net"] }
+tokio = { workspace = true, features = ["time", "rt", "net", "sync"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+codec = { workspace = true, features = ["derive"] }
 
 # Storage import
 memmap2.workspace = true
@@ -71,6 +73,7 @@ frame-system.workspace = true
 frame-support.workspace = true
 pallet-balances.workspace = true
 pallet-transaction-payment.workspace = true
+pallet-ethereum.workspace = true
 pallet-commitments.workspace = true
 pallet-drand.workspace = true
 sp-crypto-ec-utils = { workspace = true, default-features = true, features = [
